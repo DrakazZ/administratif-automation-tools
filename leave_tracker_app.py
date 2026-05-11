@@ -2,14 +2,57 @@
 import sys
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from openpyxl import Workbook
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QComboBox, QMessageBox, QTabWidget, QSpinBox
+    QPushButton, QComboBox, QMessageBox, QTabWidget, QSpinBox, QDateEdit
 )
+from PyQt5.QtCore import QDate
+from PyQt5.QtGui import QIcon
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'leave_data.db')
+def get_resource_path(relative_path):
+    # Resolve files for both dev runs and PyInstaller onefile builds.
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+def get_app_dir():
+    # Use AppData to ensure persistence in one-file EXE builds.
+    base_dir = os.getenv("APPDATA") or os.path.expanduser("~")
+    app_dir = os.path.join(base_dir, "LeaveTracker")
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+APP_DIR = get_app_dir()
+DB_PATH = os.path.join(APP_DIR, "leave_data.db")
+APP_ICON_PNG = get_resource_path("isbat.png")
+
+def get_export_dir():
+    desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+    export_dir = os.path.join(desktop_dir, "Rapports Conges")
+    os.makedirs(export_dir, exist_ok=True)
+    return export_dir
+
+EXPORT_DIR = get_export_dir()
+
+def get_export_path(filename):
+    return os.path.join(EXPORT_DIR, filename)
+
+def save_workbook(workbook, filename):
+    export_path = get_export_path(filename)
+    try:
+        workbook.save(export_path)
+        return export_path, False
+    except PermissionError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name, ext = os.path.splitext(filename)
+        fallback_name = f"{name}_{timestamp}{ext}"
+        fallback_path = get_export_path(fallback_name)
+        workbook.save(fallback_path)
+        return fallback_path, True
 
 LEAVE_TYPES = {
     'سنوية': {'yearly_add': 45, 'reset': False},
@@ -25,11 +68,16 @@ def get_column_index(cursor, column_name):
             return i
     raise ValueError(f"Column '{column_name}' not found in results")
 
+def get_table_columns(cursor, table_name):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return {row[1] for row in cursor.fetchall()}
+
 class LeaveApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("منضومة العطل")
         self.resize(600, 400)
+        self.setWindowIcon(QIcon(APP_ICON_PNG))
         self.create_db()
 
         self.tabs = QTabWidget()
@@ -55,6 +103,7 @@ class LeaveApp(QWidget):
                 reg_number TEXT PRIMARY KEY,
                 name TEXT,
                 surname TEXT,
+                rank TEXT,
                 {fields}
             )
         """)
@@ -69,6 +118,36 @@ class LeaveApp(QWidget):
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS leave_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reg_number TEXT,
+                year INTEGER,
+                leave_type TEXT,
+                days INTEGER,
+                start_date TEXT,
+                end_date TEXT,
+                action TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reset_log (
+                year INTEGER PRIMARY KEY,
+                performed_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_leave_events_reg_year
+            ON leave_events (reg_number, year)
+        """)
+
+        employee_columns = get_table_columns(cursor, "employees")
+        if "rank" not in employee_columns:
+            cursor.execute("ALTER TABLE employees ADD COLUMN rank TEXT DEFAULT ''")
+
         conn.commit()
         conn.close()
 
@@ -78,11 +157,14 @@ class LeaveApp(QWidget):
 
         self.name_input = QLineEdit()
         self.surname_input = QLineEdit()
+        self.rank_input = QLineEdit()
         self.reg_input = QLineEdit()
         layout.addWidget(QLabel("الاسم"))
         layout.addWidget(self.name_input)
         layout.addWidget(QLabel("اللقب"))
         layout.addWidget(self.surname_input)
+        layout.addWidget(QLabel("الرتبة"))
+        layout.addWidget(self.rank_input)
         layout.addWidget(QLabel("المعرف الوحيد"))
         layout.addWidget(self.reg_input)
 
@@ -111,12 +193,25 @@ class LeaveApp(QWidget):
         self.leave_type = QComboBox()
         self.leave_type.addItems(LEAVE_TYPES.keys())
 
+        self.start_date_input = QDateEdit()
+        self.start_date_input.setCalendarPopup(True)
+        self.start_date_input.setDate(QDate.currentDate())
+
+        self.end_date_input = QDateEdit()
+        self.end_date_input.setCalendarPopup(True)
+        self.end_date_input.setReadOnly(True)
+        self.end_date_input.setDate(QDate.currentDate())
+
         layout.addWidget(QLabel("المعرف الوحيد"))
         layout.addWidget(self.reg_manage)
         layout.addWidget(QLabel("عدد ايام العطل"))
         layout.addWidget(self.days_input)
         layout.addWidget(QLabel("نوع العطل"))
         layout.addWidget(self.leave_type)
+        layout.addWidget(QLabel("تاريخ البداية"))
+        layout.addWidget(self.start_date_input)
+        layout.addWidget(QLabel("تاريخ النهاية"))
+        layout.addWidget(self.end_date_input)
 
         btn_layout = QHBoxLayout()
         take_btn = QPushButton("اخذ ايام عطل")
@@ -128,6 +223,10 @@ class LeaveApp(QWidget):
 
         layout.addLayout(btn_layout)
         tab.setLayout(layout)
+
+        self.days_input.valueChanged.connect(self.update_end_date)
+        self.start_date_input.dateChanged.connect(self.update_end_date)
+        self.update_end_date()
         return tab
 
     def summary_tab(self):
@@ -179,9 +278,10 @@ class LeaveApp(QWidget):
     def add_employee(self):
         name = self.name_input.text()
         surname = self.surname_input.text()
+        rank = self.rank_input.text()
         reg = self.reg_input.text()
 
-        if not (name and surname and reg):
+        if not (name and surname and rank and reg):
             QMessageBox.warning(self, "معلومات خاطئة", "الرجاء ادخال المعلومات المطلوبة")
             return
 
@@ -189,14 +289,14 @@ class LeaveApp(QWidget):
             f"{t}_left": self.initial_left_inputs[t].value() for t in LEAVE_TYPES
         }
 
-        columns = ", ".join(["reg_number", "name", "surname"] + list(values.keys()))
+        columns = ", ".join(["reg_number", "name", "surname", "rank"] + list(values.keys()))
         placeholders = ", ".join(["?"] * len(values))
-        sql = f"INSERT INTO employees ({columns}) VALUES (?, ?, ?, {placeholders})"
+        sql = f"INSERT INTO employees ({columns}) VALUES (?, ?, ?, ?, {placeholders})"
 
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
-            cursor.execute(sql, (reg, name, surname, *values.values()))
+            cursor.execute(sql, (reg, name, surname, rank, *values.values()))
             conn.commit()
             QMessageBox.information(self, "نجاح", "تم اضافة الموظف بنجاح")
         except sqlite3.IntegrityError:
@@ -209,120 +309,162 @@ class LeaveApp(QWidget):
     def add_days(self):
         self.modify_days(1)
 
+    def update_end_date(self):
+        start_qdate = self.start_date_input.date()
+        days = self.days_input.value()
+        start = date(start_qdate.year(), start_qdate.month(), start_qdate.day())
+        end = start + timedelta(days=days - 1)
+        self.end_date_input.setDate(QDate(end.year, end.month, end.day))
+
+    def split_leave_by_year(self, start_date, end_date):
+        segments = []
+        current_start = start_date
+
+        while current_start.year < end_date.year:
+            current_end = date(current_start.year, 12, 31)
+            segment_days = (current_end - current_start).days + 1
+            segments.append((current_start, current_end, current_start.year, segment_days))
+            current_start = date(current_start.year + 1, 1, 1)
+
+        segment_days = (end_date - current_start).days + 1
+        segments.append((current_start, end_date, current_start.year, segment_days))
+        return segments
+
 
     def modify_days(self, direction):
         reg = self.reg_manage.text()
         days = self.days_input.value()
         leave_type = self.leave_type.currentText()
+        start_qdate = self.start_date_input.date()
+        start_date = date(start_qdate.year(), start_qdate.month(), start_qdate.day())
+        end_date = start_date + timedelta(days=days - 1)
 
         if not reg or not leave_type or days <= 0:
             QMessageBox.warning(self, "خطأ", "الرجاء ملء كل الحقول بشكل صحيح")
             return
 
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM employees WHERE reg_number = ?", (reg,))
-        row = cursor.fetchone()
-
-        if not row:
-            QMessageBox.warning(self, "خطأ", "الموظف غير موجود")
-            return
-
-        taken_col = f"{leave_type}_taken"
-        left_col = f"{leave_type}_left"
-        col_names = [col[0] for col in cursor.description]
-
         try:
-            left_index = col_names.index(left_col)
-            taken_index = col_names.index(taken_col)
-        except ValueError:
-            QMessageBox.warning(self, "خطأ", "نوع العطلة غير موجود في قاعدة البيانات")
-            return
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM employees WHERE reg_number = ?", (reg,))
+            row = cursor.fetchone()
 
-        current_left = row[left_index]
-
-        if direction == -1:
-            # ✅ Taking leave — restrict if not enough days
-            if current_left < days:
-                QMessageBox.warning(self, "أيام غير كافية", "لا يوجد أيام كافية لهذه العطلة")
+            if not row:
+                QMessageBox.warning(self, "خطأ", "الموظف غير موجود")
                 return
 
-            # Update employee leave balance
-            cursor.execute(f"""
-                UPDATE employees SET
-                    {taken_col} = {taken_col} + ?,
-                    {left_col} = {left_col} - ?
-                WHERE reg_number = ?
-            """, (days, days, reg))
+            taken_col = f"{leave_type}_taken"
+            left_col = f"{leave_type}_left"
+            col_names = [col[0] for col in cursor.description]
 
-            # Update or insert into leave_history
-            year = datetime.now().year  # import datetime at the top if needed
+            try:
+                left_index = col_names.index(left_col)
+                taken_index = col_names.index(taken_col)
+            except ValueError:
+                QMessageBox.warning(self, "خطأ", "نوع العطلة غير موجود في قاعدة البيانات")
+                return
 
-            cursor.execute("""
-                SELECT taken FROM leave_history
-                WHERE reg_number = ? AND year = ? AND leave_type = ?
-            """, (reg, year, leave_type))
+            current_left = row[left_index]
 
-            existing = cursor.fetchone()
+            if direction == -1:
+                # ✅ Taking leave — restrict if not enough days
+                if current_left < days:
+                    QMessageBox.warning(self, "أيام غير كافية", "لا يوجد أيام كافية لهذه العطلة")
+                    return
 
-            if existing:
+                # Update employee leave balance
+                cursor.execute(f"""
+                    UPDATE employees SET
+                        {taken_col} = {taken_col} + ?,
+                        {left_col} = {left_col} - ?
+                    WHERE reg_number = ?
+                """, (days, days, reg))
+
+                segments = self.split_leave_by_year(start_date, end_date)
+                for seg_start, seg_end, seg_year, seg_days in segments:
+                    cursor.execute("""
+                        INSERT INTO leave_events
+                            (reg_number, year, leave_type, days, start_date, end_date, action)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        reg,
+                        seg_year,
+                        leave_type,
+                        seg_days,
+                        seg_start.isoformat(),
+                        seg_end.isoformat(),
+                        "take",
+                    ))
+
+
+            elif direction == 1:
+                # ✅ Adding days — allow resulting negative or high values (no restriction)
+                cursor.execute(f"""
+                    UPDATE employees SET
+                        {left_col} = {left_col} + ?
+                    WHERE reg_number = ?
+                """, (days, reg))
+
                 cursor.execute("""
-                    UPDATE leave_history
-                    SET taken = taken + ?
-                    WHERE reg_number = ? AND year = ? AND leave_type = ?
-                """, (days, reg, year, leave_type))
-            else:
-                cursor.execute("""
-                    INSERT INTO leave_history (reg_number, year, leave_type, taken)
-                    VALUES (?, ?, ?, ?)
-                """, (reg, year, leave_type, days))
+                    INSERT INTO leave_events
+                        (reg_number, year, leave_type, days, start_date, end_date, action)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    reg,
+                    start_date.year,
+                    leave_type,
+                    days,
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    "adjust_add",
+                ))
 
-
-        elif direction == 1:
-            # ✅ Adding days — allow resulting negative or high values (no restriction)
-            cursor.execute(f"""
-                UPDATE employees SET
-                    {left_col} = {left_col} + ?
-                WHERE reg_number = ?
-            """, (days, reg))
-
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
         QMessageBox.information(self, "تحديث", "تم تحديث بيانات العطلة بنجاح")
 
     def show_summary(self):
         reg = self.reg_summary.text()
         year = self.year_input.value()
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        try:
+            cursor = conn.cursor()
 
-        # Fetch employee data first
-        cursor.execute("SELECT * FROM employees WHERE reg_number = ?", (reg,))
-        row = cursor.fetchone()
-        if not row:
-            QMessageBox.warning(self, "خطأ", "الموظف غير موجود")
-            return
+            # Fetch employee data first
+            cursor.execute("SELECT * FROM employees WHERE reg_number = ?", (reg,))
+            row = cursor.fetchone()
+            if not row:
+                QMessageBox.warning(self, "خطأ", "الموظف غير موجود")
+                return
 
-        employee_cols = [col[0] for col in cursor.description]
-        name, surname = row[1], row[2]
-        summary = f"الاسم: {name} {surname}\nالسنة: {year}\n\n"
+            employee_cols = [col[0] for col in cursor.description]
+            rank_index = employee_cols.index("rank") if "rank" in employee_cols else None
+            name, surname = row[1], row[2]
+            rank = row[rank_index] if rank_index is not None else ""
+            summary = f"الاسم: {name} {surname}\nالرتبة: {rank}\nالسنة: {year}\n\n"
 
-        # Now fetch history AFTER employee data
-        cursor.execute("SELECT leave_type, taken FROM leave_history WHERE reg_number = ? AND year = ?", (reg, year))
-        history = dict(cursor.fetchall())
+            cursor.execute("""
+                SELECT leave_type, SUM(days)
+                FROM leave_events
+                WHERE reg_number = ? AND year = ? AND action = ?
+                GROUP BY leave_type
+            """, (reg, year, "take"))
+            history = {row[0]: row[1] for row in cursor.fetchall()}
 
-        for t in LEAVE_TYPES:
-            taken = history.get(t, 0)
-            try:
-                left_index = employee_cols.index(f"{t}_left")
-                left = row[left_index]
-            except ValueError:
-                left = "؟"
+            for t in LEAVE_TYPES:
+                taken = history.get(t, 0)
+                try:
+                    left_index = employee_cols.index(f"{t}_left")
+                    left = row[left_index]
+                except ValueError:
+                    left = "؟"
 
-            summary += f"{t}: أخذ = {taken}, متبقي = {left}\n"
+                summary += f"{t}: أخذ = {taken}, متبقي حاليا = {left}\n"
 
-        self.summary_label.setText(summary)
-        conn.close()
+            self.summary_label.setText(summary)
+        finally:
+            conn.close()
 
 
 
@@ -339,16 +481,11 @@ class LeaveApp(QWidget):
             conn.close()
             return
 
-        # Optional: If reset already done this year, block or warn (from previous logic)
-        cursor.execute("SELECT COUNT(*) FROM leave_history WHERE year = ?", (year,))
-        already_reset = cursor.fetchone()[0] > 0
-        if already_reset:
-            reply = QMessageBox.question(self, "تحذير", 
-                f"تمت إعادة الضبط لهذا العام {year} مسبقاً. هل تريد المتابعة؟", 
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                conn.close()
-                return
+        cursor.execute("SELECT 1 FROM reset_log WHERE year = ?", (year,))
+        if cursor.fetchone():
+            QMessageBox.warning(self, "تحذير", f"تم بالفعل إعادة الضبط لهذه السنة: {year}")
+            conn.close()
+            return
 
         reply = QMessageBox.question(self, "تأكيد", f"هل أنت متأكد أنك تريد إعادة ضبط السنة {year}؟",
                              QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -356,30 +493,13 @@ class LeaveApp(QWidget):
             conn.close()
             return
 
-        # 🛡️ Prevent duplicate reset for the same year
-        cursor.execute("SELECT COUNT(*) FROM leave_history WHERE year = ?", (year,))
-        already_reset = cursor.fetchone()[0] > 0
-
-        if already_reset:
-            QMessageBox.warning(self, "تحذير", f"تم بالفعل إعادة الضبط لهذه السنة: {year}")
-            conn.close()
-            return
-
         backup_filename = f"نسخة_احتياطية_قبل_إعادة_الضبط_{year}.xlsx"
         self.export_current_summary_to_excel(backup_filename)
 
-        cursor.execute("SELECT reg_number FROM employees")
-        reg_numbers = [row[0] for row in cursor.fetchall()]
-
-        for reg in reg_numbers:
-            for t, props in LEAVE_TYPES.items():
-                taken_col = f"{t}_taken"
-                cursor.execute(f"SELECT {taken_col} FROM employees WHERE reg_number = ?", (reg,))
-                taken = cursor.fetchone()[0]
-                cursor.execute("""
-                    INSERT OR REPLACE INTO leave_history (reg_number, year, leave_type, taken)
-                    VALUES (?, ?, ?, ?)
-                """, (reg, year, t, taken))
+        cursor.execute("INSERT INTO reset_log (year, performed_at) VALUES (?, ?)", (
+            year,
+            datetime.now().isoformat(timespec="seconds"),
+        ))
 
         for t, props in LEAVE_TYPES.items():
             if props['reset']:
@@ -405,20 +525,26 @@ class LeaveApp(QWidget):
 
         # Store column names from employee table BEFORE changing queries
         employee_cols = [col[0] for col in cursor.description]
+        rank_index = employee_cols.index("rank") if "rank" in employee_cols else None
         name, surname = employee_row[1], employee_row[2]
+        rank = employee_row[rank_index] if rank_index is not None else ""
         
-        # Now get history data
-        cursor.execute("SELECT leave_type, taken FROM leave_history WHERE reg_number = ? AND year = ?", (reg, year))
-        history = dict(cursor.fetchall())
+        cursor.execute("""
+            SELECT leave_type, SUM(days)
+            FROM leave_events
+            WHERE reg_number = ? AND year = ? AND action = ?
+            GROUP BY leave_type
+        """, (reg, year, "take"))
+        history = {row[0]: row[1] for row in cursor.fetchall()}
 
         wb = Workbook()
         ws = wb.active
         ws.title = f"ملخص {reg}"
 
-        ws.append(["رقم التسجيل", "الاسم", "اللقب", "السنة"])
-        ws.append([reg, name, surname, year])
+        ws.append(["رقم التسجيل", "الاسم", "اللقب", "الرتبة", "السنة"])
+        ws.append([reg, name, surname, rank, year])
         ws.append([])
-        ws.append(["نوع العطلة", "الأيام المستعملة", "الأيام المتبقية"])
+        ws.append(["نوع العطلة", "الأيام المستعملة", "الأيام المتبقية (حاليا)"])
 
         for t in LEAVE_TYPES:
             taken = history.get(t, 0)
@@ -431,10 +557,24 @@ class LeaveApp(QWidget):
             
             ws.append([t, taken, left])
 
+        details_ws = wb.create_sheet(title="تفاصيل العطل")
+        details_ws.append(["نوع العطلة", "عدد الايام", "تاريخ البداية", "تاريخ النهاية"])
+        cursor.execute("""
+            SELECT leave_type, days, start_date, end_date
+            FROM leave_events
+            WHERE reg_number = ? AND year = ? AND action = ?
+            ORDER BY start_date
+        """, (reg, year, "take"))
+        for row in cursor.fetchall():
+            details_ws.append(list(row))
+
         filename = f"ملخص_{reg}_{year}.xlsx"
-        wb.save(filename)
+        saved_path, used_fallback = save_workbook(wb, filename)
         conn.close()
-        QMessageBox.information(self, "تم الحفظ", f"تم حفظ ملخص الموظف في الملف:\n{filename}")
+        if used_fallback:
+            QMessageBox.warning(self, "تم الحفظ", f"تعذر الكتابة على الملف المطلوب. تم حفظ نسخة جديدة في:\n{saved_path}")
+        else:
+            QMessageBox.information(self, "تم الحفظ", f"تم حفظ ملخص الموظف في الملف:\n{saved_path}")
 
     
     def export_current_summary_to_excel(self, filename="نسخة_احتياطية_قبل_إعادة_الضبط.xlsx"):
@@ -450,20 +590,27 @@ class LeaveApp(QWidget):
         ] + [
             f"المتبقية ({t})" for t in LEAVE_TYPES
         ]
+        headers.insert(3, "الرتبة")
         ws.append(headers)
 
         cursor.execute("SELECT * FROM employees")
+        employee_cols = [col[0] for col in cursor.description]
+        rank_index = employee_cols.index("rank") if "rank" in employee_cols else None
         rows = cursor.fetchall()
         for row in rows:
-            base = list(row[:3])  # رقم التسجيل، الاسم، اللقب
+            rank = row[rank_index] if rank_index is not None else ""
+            base = [row[0], row[1], row[2], rank]
             taken = [row[get_column_index(cursor, f"{t}_taken")] for t in LEAVE_TYPES]
             left = [row[get_column_index(cursor, f"{t}_left")] for t in LEAVE_TYPES]
             ws.append(base + taken + left)
 
-        wb.save(filename)
+        saved_path, used_fallback = save_workbook(wb, filename)
         conn.close()
 
-        QMessageBox.information(self, "تم الحفظ", f"تم حفظ الملخص في الملف:\n{filename}")
+        if used_fallback:
+            QMessageBox.warning(self, "تم الحفظ", f"تعذر الكتابة على الملف المطلوب. تم حفظ نسخة جديدة في:\n{saved_path}")
+        else:
+            QMessageBox.information(self, "تم الحفظ", f"تم حفظ الملخص في الملف:\n{saved_path}")
 
     def export_all_summaries_to_excel(self, year):
         conn = sqlite3.connect(DB_PATH)
@@ -473,7 +620,7 @@ class LeaveApp(QWidget):
         ws = wb.active
         ws.title = f"ملخص {year}"
 
-        headers = ["رقم التسجيل", "الاسم", "اللقب"] + [
+        headers = ["رقم التسجيل", "الاسم", "اللقب", "الرتبة"] + [
             f"المستعملة ({t})" for t in LEAVE_TYPES
         ] + [
             f"المتبقية ({t})" for t in LEAVE_TYPES
@@ -484,15 +631,21 @@ class LeaveApp(QWidget):
         cursor.execute("SELECT * FROM employees")
         all_employee_rows = cursor.fetchall()
         employee_cols = [col[0] for col in cursor.description]  # Store column names
+        rank_index = employee_cols.index("rank") if "rank" in employee_cols else None
 
         for employee_row in all_employee_rows:
             reg = employee_row[0]
             name = employee_row[1]
             surname = employee_row[2]
+            rank = employee_row[rank_index] if rank_index is not None else ""
             
-            # Get history for this employee
-            cursor.execute("SELECT leave_type, taken FROM leave_history WHERE reg_number = ? AND year = ?", (reg, year))
-            history = dict(cursor.fetchall())
+            cursor.execute("""
+                SELECT leave_type, SUM(days)
+                FROM leave_events
+                WHERE reg_number = ? AND year = ? AND action = ?
+                GROUP BY leave_type
+            """, (reg, year, "take"))
+            history = {row[0]: row[1] for row in cursor.fetchall()}
             
             # Build taken and left arrays using stored column info
             taken = [history.get(t, 0) for t in LEAVE_TYPES]
@@ -505,12 +658,15 @@ class LeaveApp(QWidget):
                 except ValueError:
                     left.append("غير متوفر")  # Fallback if column doesn't exist
             
-            ws.append([reg, name, surname] + taken + left)
+            ws.append([reg, name, surname, rank] + taken + left)
 
         filename = f"ملخص_جميع_الموظفين_{year}.xlsx"
-        wb.save(filename)
+        saved_path, used_fallback = save_workbook(wb, filename)
         conn.close()
-        QMessageBox.information(self, "تم الحفظ", f"تم حفظ الملخص في الملف:\n{filename}")
+        if used_fallback:
+            QMessageBox.warning(self, "تم الحفظ", f"تعذر الكتابة على الملف المطلوب. تم حفظ نسخة جديدة في:\n{saved_path}")
+        else:
+            QMessageBox.information(self, "تم الحفظ", f"تم حفظ الملخص في الملف:\n{saved_path}")
 
     def export_selected_summary(self):
         reg = self.reg_summary.text()
@@ -527,6 +683,7 @@ class LeaveApp(QWidget):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(APP_ICON_PNG))
     window = LeaveApp()
     window.show()
     sys.exit(app.exec_())
